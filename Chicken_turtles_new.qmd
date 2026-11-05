@@ -1,0 +1,497 @@
+---
+title: "Chicken_turtles_clean"
+format: 
+  html:
+    embed-resources: true
+    code-fold: true
+    toc: true
+editor: visual
+---
+
+## Install and load packages
+
+```{r}
+## install.packages(c("rlang", "sf", "terra", "ggspatial", "prettymapr", "FedData", "tmap", "tidyverse", "units"), repos = "https://cloud.r-project.org") ##
+library(ggspatial)
+library(sf)    
+library(terra)
+library(tidyverse)
+library(prettymapr)
+library(FedData)
+library(tmap)
+library(rlang)
+library(units)
+```
+
+## Import data (use your own file paths)
+
+```{r}
+##Import NLCD landcover data 
+nlcd <- rast("C:/Users/andre/Documents/Documents/Data Freelance/Chicken_Turtles/FGCU_landcover.tiff")
+nlcd_2010 <- rast("C:/Users/andre/Documents/Documents/Data Freelance/Chicken_Turtles/FGCU_landcover2010.tif")
+nlcd_2011 <- rast("C:/Users/andre/Documents/Documents/Data Freelance/Chicken_Turtles/FGCU_landcover2011.tif")
+
+##Import turtles Observations
+Chicken_Turtles <- read.csv("C:/Users/andre/Documents/Documents/Data Freelance/Chicken_Turtles/Chicken_Turtles.csv")
+
+```
+
+## Transform data into shapefiles and match coordinate systems
+
+```{r}
+# Coordinate systems checks
+crs(nlcd)
+crs(nlcd_2010)
+crs(nlcd_2011)
+# transforma data
+turtles_sf   <- st_as_sf(Chicken_Turtles, coords = c("long", "lat"), crs = 4326)
+turtles_proj <- st_transform(turtles_sf, crs = crs(nlcd))
+```
+
+## Clean up dates
+
+```{r}
+# Dates and years
+
+table(turtles_proj$Year)
+turtles_proj$date_clean <- dmy(turtles_proj$date)
+turtles_proj$Year <- as.factor(turtles_proj$Year)
+
+```
+
+## Cropping rasters and observations to the same area
+
+```{r}
+# 5 km buffer, used to crop rasters and roads
+turtles_buff <- st_buffer(turtles_proj, dist = 5000)
+
+# crop obersvations with rasters
+nlcd_crop <- crop(nlcd, vect(turtles_buff))
+nlcd_crop_2010 <- crop(nlcd_2010, vect(turtles_buff))
+nlcd_crop_2011 <- crop(nlcd_2011, vect(turtles_buff))
+```
+
+## Roads
+
+```{r}
+## Checking the coordinate system of the road shapefile using a query since they're massive. Use your own file path
+st_crs(st_read("C:/Users/andre/Documents/Documents/Data Freelance/Chicken_Turtles/Florida_roads/Trans_RoadSegment_0.shp", quiet = TRUE, query = "SELECT * FROM Trans_RoadSegment_0 LIMIT 1"))
+
+## Match coordinate systems and create a polygon around the roads we want
+bbox_wkt <- st_as_text(st_as_sfc(st_bbox(st_transform(turtles_buff, crs = "NAD83"))))
+
+## testing the filter. Should return only road segments within the polygon
+roads_test <- st_read("C:/Users/andre/Documents/Documents/Data Freelance/Chicken_Turtles/Florida_roads/Trans_RoadSegment_0.shp", wkt_filter = bbox_wkt, quiet = TRUE)
+nrow(roads_test)  
+
+## Pull out only road shapefiles from the dataset
+segments <- list.files("C:/Users/andre/Documents/Documents/Data Freelance/Chicken_Turtles/Florida_roads", pattern = "Trans_RoadSegment.*\\.shp$", full.names = TRUE)
+
+## Figuring out which shape files have roads within our buffer. This code might take a second to run
+results <- lapply(segments, function(f) {
+  r <- tryCatch(st_read(f, wkt_filter = bbox_wkt), error = function(e) NULL)
+  nrow(r)
+})
+names(results) <- basename(segments)
+results
+
+## putting those roads into one list and making sure all coordinate systems match
+roads_list <- lapply(segments, function(f) {
+  st_read(f, wkt_filter = bbox_wkt)
+})
+
+roads_fl <- do.call(rbind, roads_list)
+roads_proj <- st_transform(roads_fl, crs = crs(nlcd_crop))
+
+```
+
+### Crop, classify, and split by road type
+
+```{r}
+
+tnmfrc_labels <- c(
+  "1" = "Interstate/Highway",
+  "4" = "Local Road"
+)
+
+roads_final <- st_crop(roads_proj, ext(nlcd_crop))
+roads_final$road_type <- tnmfrc_labels[as.character(roads_final$tnmfrc)]
+roads_final <- roads_final[!is.na(roads_final$road_type), ]
+
+roads_highway <- roads_final[roads_final$road_type == "Interstate/Highway", ]
+roads_local   <- roads_final[roads_final$road_type == "Local Road", ]
+```
+
+## Add habitat labels
+
+```{r}
+nlcd_labels <- data.frame(
+  value = c(11, 21, 22, 23, 24, 90, 95),
+  label = c("Open Water", "Developed, Open Space", "Developed, Low Intensity",
+            "Developed, Medium Intensity", "Developed, High Intensity", "Woody Wetlands", "Emergent Herbaceous Wetlands")
+)
+## Define custom color pallette
+nlcd_palette_present <- c(
+  "Open Water"                   = "#4682B4",
+  "Developed, Open Space"        = "#E0D6C3",
+  "Developed, Low Intensity"     = "#C5B5A1",
+  "Developed, Medium Intensity"  = "#9E8E81",
+  "Developed, High Intensity"    = "#6E6058",
+  "Woody Wetlands"               = "#5A8F7B",
+  "Emergent Herbaceous Wetlands" = "#7FA09B"
+)
+levels(nlcd_crop)      <- nlcd_labels
+levels(nlcd_crop_2010) <- nlcd_labels
+levels(nlcd_crop_2011) <- nlcd_labels
+```
+
+## Maps
+
+### Define the map extent
+
+```{r}
+zoom_bbox <- st_bbox(st_buffer(turtles_proj, dist = 250))
+```
+
+### Map draft
+
+```{r}
+tm_shape(nlcd_crop, bbox = zoom_bbox) +
+  tm_raster(style = "cat", palette = nlcd_palette_present, title = "Habitat Type") +
+tm_shape(roads_local) +
+  tm_lines(col = "gray30", lwd = 0.6) +
+tm_shape(roads_highway) +
+  tm_lines(col = "black", lwd = 2.5) +
+tm_shape(turtles_proj) +
+  tm_dots(size = 0.4, col = "black") +
+tm_layout(
+  frame = TRUE,
+  legend.outside = TRUE,
+  legend.outside.position = "right",
+  legend.title.size = 1.1,
+  legend.text.size = 0.8
+) +
+tm_compass(position = c("right", "top"), size = 1.5) +
+tm_scalebar(position = c("left", "bottom"))
+```
+
+### Precise Map
+
+```{r}
+
+Turtles_precise <- tm_shape(nlcd_crop, bbox = zoom_bbox) +
+  tm_raster(
+    style = "cat",
+    palette = nlcd_palette_present,
+    title = "Habitat Type",
+    drop.levels = TRUE 
+  ) +
+  tm_graticules(
+    lines = TRUE,
+    labels.size = 0.6,
+    n.x = 7,
+    col = "gray70",
+    lwd = 0.3
+  ) +
+  tm_shape(roads_local) +
+  tm_lines(
+    col = "gray30",
+    lwd = 2
+  ) +
+  tm_shape(turtles_proj) +
+  tm_symbols(
+    size = 1,
+    lwd = 2,
+    fill = "Year",
+    shape = "Accuracy",
+    fill.scale = tm_scale_categorical(values = "area7d"),
+    shape.scale = tm_scale_categorical(values = c("Approximate" = 22, "Exact" = 21)),
+    fill.legend = tm_legend(title = "Year Observed"),
+    shape.legend = tm_legend_hide(),
+    col = "black"
+  ) +
+  tm_layout(
+    main.title = "Chicken Turtle Observations",
+    main.title.size = 1.2,
+    main.title.position = "center",
+    frame = TRUE,
+    legend.outside = TRUE,
+    legend.outside.position = "right",
+    legend.title.size = 1.1,
+    legend.text.size = 0.8
+  ) +
+  tm_compass(
+    position = c("right", "top"),
+    size = 1.5
+  ) +
+  tm_scalebar(
+    position = c("left", "bottom")
+  ) +
+  tm_add_legend(
+  type = "symbols",
+  title = "Location precision",
+  labels = c("Approximate", "Exact"),
+  shape = c(22, 21),
+  fill = c("gray90", "gray40"),
+  col = "black"
+) 
+
+Turtles_precise
+```
+
+### Buffered Map
+
+```{r}
+## Define buffer size 
+turtles_buffered <- st_buffer(turtles_proj, dist = 100)
+
+## Create map
+Turtles_buffered <- tm_shape(nlcd_crop, bbox = zoom_bbox) +
+  tm_raster(style = "cat", palette = nlcd_palette_present, title = "Habitat Type") +
+  tm_graticules(
+    lines = TRUE,
+    labels.size = 0.6,
+    col = "gray70",
+    n.x = 7,
+    lwd = 0.3
+  ) +
+tm_shape(roads_local) +
+  tm_lines(col = "gray30", lwd = 2) +
+tm_shape(turtles_buffered) +
+  tm_polygons(
+    fill = "Year",
+    fill.scale = tm_scale_categorical(values = "area7d"),
+    fill.legend = tm_legend(title = "Year Observed"),
+    fill_alpha = 0.7,
+    col = "black",
+    lwd = 0.5
+  ) +
+tm_layout(
+  main.title = "Chicken Turtle Observations",
+  main.title.size = 1.2,
+  main.title.position = "center",
+  frame = TRUE,
+  legend.outside = TRUE,
+  legend.outside.position = "right",
+  legend.title.size = 1.1,
+  legend.text.size = 0.8
+) +
+tm_compass(position = c("right", "top"), size = 1.5) +
+tm_scalebar(position = c("left", "bottom"))
+
+Turtles_buffered
+```
+
+### Landcover change
+
+```{r}
+Landcover_2010 <- tm_shape(nlcd_crop_2010, bbox = zoom_bbox) +
+  tm_raster(style = "cat", palette = nlcd_palette_present, title = "Habitat Type") +
+  tm_graticules(
+    lines = TRUE,
+    labels.size = 0.6,
+    n.x = 7,
+    col = "gray70",
+    lwd = 0.3
+  ) +
+tm_shape(roads_local) +
+  tm_lines(col = "gray30", lwd = 2) +
+tm_layout(
+  main.title = "Landcover 2010",
+  main.title.size = 1.2,
+  main.title.position = "center",
+  frame = TRUE,
+  legend.outside = TRUE,
+  legend.outside.position = "right",
+  legend.title.size = 1.1,
+  legend.text.size = 0.8
+) +
+tm_compass(position = c("right", "top"), size = 1.5) +
+tm_scalebar(position = c("left", "bottom"))
+
+Landcover_2025 <- tm_shape(nlcd_crop, bbox = zoom_bbox) +
+  tm_raster(style = "cat", palette = nlcd_palette_present, title = "Habitat Type") +
+  tm_graticules(
+    lines = TRUE,
+    labels.size = 0.6,
+    n.x = 7,
+    col = "gray70",
+    lwd = 0.3
+  ) +
+tm_shape(roads_local) +
+  tm_lines(col = "gray30", lwd = 2) +
+tm_layout(
+  main.title = "Landcover 2025",
+  main.title.size = 1.2,
+  main.title.position = "center",
+  frame = TRUE,
+  legend.outside = TRUE,
+  legend.outside.position = "right",
+  legend.title.size = 1.1,
+  legend.text.size = 0.8
+) +
+tm_compass(position = c("right", "top"), size = 1.5) +
+tm_scalebar(position = c("left", "bottom"))
+
+Landcover_2010
+Landcover_2025
+```
+
+## Timeline of observations
+
+```{r}
+
+Turtles_timeline <- ggplot(turtles_proj, aes(x = as.numeric(as.character(Year)))) +
+  geom_dotplot(
+    binwidth = 1,
+    binaxis = "x",
+    dotsize = 0.5,
+    fill = "darkgreen",
+    color = "black"
+  ) +
+  scale_x_continuous(
+    breaks = seq(min(as.numeric(as.character(turtles_proj$Year)), na.rm = TRUE),
+                 max(as.numeric(as.character(turtles_proj$Year)), na.rm = TRUE), 
+                 by = 1)
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(
+    title = "Chicken Turtle Observations by Year",
+    x = "Year",
+    y = "Count"
+  )
+
+Turtles_timeline
+```
+
+## Habitat composition: 2010 vs. 2025
+
+### Align the rasters
+
+```{r}
+
+zoom_ext <- ext(zoom_bbox["xmin"], zoom_bbox["xmax"], zoom_bbox["ymin"], zoom_bbox["ymax"])
+
+nlcd_2010_aligned <- crop(nlcd_2010, zoom_ext)
+nlcd_2025_aligned <- crop(nlcd,      zoom_ext)
+
+nlcd_mask_common  <- as.polygons(nlcd_2025_aligned > -Inf, dissolve = TRUE)
+nlcd_2010_aligned <- mask(nlcd_2010_aligned, nlcd_mask_common)
+nlcd_2025_aligned <- mask(nlcd_2025_aligned, nlcd_mask_common)
+
+levels(nlcd_2010_aligned) <- nlcd_labels
+levels(nlcd_2025_aligned) <- nlcd_labels
+```
+
+### Area by habitat type
+
+```{r}
+
+freq_2010 <- freq(nlcd_2010_aligned)
+freq_2025 <- freq(nlcd_2025_aligned)
+
+# Cell area in m^2 converted to hectares
+cell_size <- res(nlcd_2010_aligned)[1] * res(nlcd_2010_aligned)[2]
+
+freq_2010$area_ha <- freq_2010$count * cell_size / 10000
+freq_2025$area_ha <- freq_2025$count * cell_size / 10000
+
+freq_2010$year <- "2010"
+freq_2025$year <- "2025"
+
+habitat_compare <- rbind(
+  freq_2010[, c("value", "area_ha", "year")],
+  freq_2025[, c("value", "area_ha", "year")]
+)
+
+freq_2010
+freq_2025
+```
+
+### Bar chart
+
+```{r}
+
+Habitat_comparison <- ggplot(habitat_compare, aes(x = value, y = area_ha, fill = year)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("2010" = "#66C2A5", "2025" = "#FC8D62")) +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Habitat Composition, 2010 vs. 2025",
+    x = "Habitat Type",
+    y = "Area (hectares)",
+    fill = "Year"
+  )
+
+Habitat_comparison
+```
+
+## Observation extent by year
+
+### Summary table
+
+```{r}
+## For each year, count the observations, find the first and last dates, and calculate the area of the bounding box around the points in hectares.
+extent_by_year <- turtles_proj %>%
+  group_by(Year) %>%
+  group_modify(~ {
+    d <- .x
+    tibble(
+      n_obs = nrow(d),
+      date_min = if (all(is.na(d$date_clean))) as.Date(NA) else min(d$date_clean, na.rm = TRUE),
+      date_max = if (all(is.na(d$date_clean))) as.Date(NA) else max(d$date_clean, na.rm = TRUE),
+      bbox_area_ha = if (nrow(d) > 1) {as.numeric(set_units(st_area(st_as_sfc(st_bbox(d))), "ha"))} else
+        {NA_real_})}) %>%
+  ungroup()
+
+## Format those results into a table 
+extent_summary <- extent_by_year %>%
+  transmute(
+    Year,
+    `Date Range` = if_else(
+      is.na(date_min),
+      "No date recorded",
+      paste(format(date_min, "%b %d"), "–", format(date_max, "%b %d"))),
+    `# Observations` = n_obs,
+    `Bounding Box Area (ha)` = round(bbox_area_ha, 2))
+
+extent_summary
+
+```
+
+```{r}
+tmap_save(Turtles_precise, filename = "outputs/turtle_map_precise.png", width = 10, height = 8, units = "in", dpi = 300)
+tmap_save(Turtles_buffered, filename = "outputs/turtle_map_generalized.png", width = 10, height = 8, units = "in", dpi = 300)
+tmap_save(Landcover_2010, filename = "outputs/habitat_2010.png", width = 10, height = 8, units = "in", dpi = 300)
+tmap_save(Landcover_2025, filename = "outputs/habitat_2025.png", width = 10, height = 8, units = "in", dpi = 300)
+ggsave("outputs/observations_timeline.png", plot = Turtles_timeline, width = 8, height = 5, dpi = 300)
+```
+
+```{r}
+write.csv(extent_summary, "outputs/turtle_extent_summary.csv", row.names = FALSE)
+ggsave("outputs/habitat_comparison_barchart.png", plot = Habitat_comparison, width = 8, height = 6, dpi = 300)
+
+
+library(zip)
+
+zip::zip(zipfile = "Chicken_Turtle_Analysis_Final.zip", files = list.files("outputs", full.names = TRUE))
+
+readme_text <- "Chicken Turtle Habitat Analysis — Final Deliverables
+
+- turtle_map_precise.png: Exact observation locations with habitat/road context
+- turtle_map_generalized.png: Generalized locations (100m buffer) for public sharing
+- habitat_2010.png / habitat_2025.png: Habitat composition comparison, same study area
+- observations_timeline.png: Observations plotted by date
+- habitat_comparison_barchart.png: Habitat area by type, 2010 vs 2025
+- turtle_extent_summary.csv: Summary table of date range, observation count, and spatial extent per year"
+
+writeLines(readme_text, "outputs/README.txt")
+
+```
